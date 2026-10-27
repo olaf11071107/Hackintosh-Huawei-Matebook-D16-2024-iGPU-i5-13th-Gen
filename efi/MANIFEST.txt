@@ -1,0 +1,31 @@
+# Kexts (folder, version, sha256 of executable)
+AirportItlwm.kext            2.4.0      259bac9432bffa8b
+AppleALC.kext                1.9.6      85a43be38ce400d5
+ECEnabler.kext               1.0.6      af2a3a6790a37f5b
+Lilu.kext                    1.7.3      e3f00df5aca98c70
+NootedGreen.kext             1.0.0      d996f9d0f2364fdb
+SMCBatteryManager.kext       1.3.9      791d81018a5374dd
+SMCProcessor.kext            1.3.9      dcf7386714317216
+USBToolBox.kext                         c5c8dc205a079ee3
+UTBDefault.kext              1.0        -
+VirtualSMC.kext              1.3.9      bf91e9542b86c20a
+VoodooI2C.kext               2.9.1      dbb7865eec4eeb0e
+VoodooI2CHID.kext            1.0        1ba930b05d5c786b
+VoodooPS2Controller.kext     2.3.8      be6f3aa9dc889544
+WhateverGreen.kext           1.7.2      059967ba94fba6cb
+UTBMap.kext                  1.1        -
+BrightnessKeys.kext                     74c5cbc2dbeba0ae
+SimpleHDA.kext               1.0.0      f74c9dbddf43266c
+
+# ACPI tables (md5)
+ad4ea5c321bf521afaf9e6d022ac5587  SSDT-HWFN.aml
+ea64e1476ad40b743988cc0a2d106ff3  SSDT-EC.aml
+02d20a2ab03cc31cc25bfba18db0955e  SSDT-USBX.aml
+d6f2fc33f1485a293efd2440a351aeaa  SSDT-PLUG-ALT.aml
+b16ac1d2f812ffe82fe6f150ca290f8c  SSDT-RTCAWAC.aml
+a52ce465487f362f5f5c6622f659aa57  SSDT-XOSI.aml
+fabb38141e0e3825f1b70a2d2ab74273  SSDT-PNLF.aml
+f750f2ab6abb538e0f83e31a80b23c3d  SSDT-TPDX.aml
+
+# boot-args
+-ngreentglwithgfx -allow3d -disablegfxfirmware ngreen-dmc=adlp -ngreenv189 -ngreenkeepefi -ngreenxefix -ngreenfixbootmode ngreenSched=4 ngreenV142=3 gfxrst=1 ngreen-eu=48 ngreen-l3=6 ngreengtfreq=1400 ngreenblmax=17741 -vi2c-force-polling amfi_get_out_of_my_way=1 -v keepsyms=1 debug=0x100 msgbuf=1048576 ngreengammamask=0x7fffffff alcid=15
