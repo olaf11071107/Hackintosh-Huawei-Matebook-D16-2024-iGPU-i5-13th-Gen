@@ -1,0 +1,7 @@
+.DS_Store
+._*
+*.dSYM/
+*.kext/
+*.zip
+build/
+efi/*.kext

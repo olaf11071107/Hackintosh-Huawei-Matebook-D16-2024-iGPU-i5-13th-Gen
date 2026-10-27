@@ -1,0 +1,609 @@
+diff --git a/src/NootedGreen/kern_gen11.cpp b/src/NootedGreen/kern_gen11.cpp
+index e3b34c0..f32811e 100755
+--- a/src/NootedGreen/kern_gen11.cpp
++++ b/src/NootedGreen/kern_gen11.cpp
+@@ -1068,6 +1068,75 @@ static void fbTimingsWorker(thread_call_param_t, thread_call_param_t) {
+ 	}
+ }
+ 
++// XE-HDMI: ngreenhdmi=<DDI> puts an HDMI connector on that DDI (1/2 = combo B/C, 3..8 = TC1..TC6). On the Huawei
++// MCLG-XX the HDMI socket is TC2 in legacy mode (SDEISR bit 25 live with a monitor attached; only GMBUS pin 10
++// answered). Apple's hwDoGMBusRequest only accepts bus numbers below 8 and writes them straight into the GMBUS0
++// pin field, so a TC port's pin (DDI + 6) cannot be named: the connector gets placeholder bus 7 and GMBUS0 writes
++// selecting pin 7 are redirected to the real pin.
++static uint32_t xeHdmiDdi() {
++	static int ddi = -1;
++	if (ddi < 0) { ddi = 0; PE_parse_boot_argn("ngreenhdmi", &ddi, sizeof(ddi)); if (ddi < 1 || ddi > 8) ddi = 0; }
++	return (uint32_t)ddi;
++}
++static uint32_t xeHdmiBus() { uint32_t d = xeHdmiDdi(); return d >= 3 ? 7 : d + 1; }
++static uint32_t xeHdmiPin() { uint32_t d = xeHdmiDdi(); return d >= 3 ? d + 6 : d + 1; }
++
++
++// XE-HDMIDIAG (only with ngreenhdmi): find where Apple's Type-C bring-up stops. Logs Apple's writes to the
++// registers involved (power wells, PCODE mailbox, FIA, Dekel PHY, DDI/transcoder/clock, hotplug, GMBUS) and
++// enter/exit of the AppleIntelPort functions that bring a port up, for Type-C ports (DDI >= 3) only.
++static int gHdDiagN = 0;
++#define XE_HD_LOG(...) do { if (gHdDiagN++ < 800) IOLog(__VA_ARGS__); } while (0)
++
++static bool xeHdDiagReg(uint32_t r) {
++	return (r >= 0x45400 && r < 0x45480) || (r >= 0x138120 && r < 0x138130) ||
++	       (r >= 0x163000 && r < 0x164000) || (r >= 0x16E000 && r < 0x170000) ||
++	       (r >= 0x168000 && r < 0x16E000) || r == 0x1010A0 || r == 0x1010A4 ||
++	       (r >= 0x64300 && r < 0x64500) || r == 0x61400 || r == 0x62400 ||
++	       (r >= 0x46000 && r < 0x46040) || (r >= 0x46100 && r < 0x46120) || (r >= 0x164280 && r < 0x164290) ||
++	       (r >= 0xC4000 && r < 0xC4040) || r == 0x44038 || (r >= 0x44470 && r < 0x44480) ||
++	       (r >= 0xC5100 && r < 0xC510C) || r == 0xC5110;
++}
++
++static uint32_t xePortDdi(void *port) {
++	auto *pc = getMember<uint32_t *>(port, 0x548);
++	return pc ? pc[0] : 0xFF;
++}
++
++static mach_vm_address_t oPortSetMode, oPortProbe, oPortEnable, oPortDDC;
++
++static uint64_t wrapPortSetMode(void *port, uint64_t mode) {
++	uint32_t d = xePortDdi(port);
++	if (d >= 3 && d != 0xFF) XE_HD_LOG("XeNG hd: setPortMode ddi=%u mode=%llu enter\n", d, mode);
++	uint64_t r = FunctionCast(wrapPortSetMode, oPortSetMode)(port, mode);
++	if (d >= 3 && d != 0xFF) XE_HD_LOG("XeNG hd: setPortMode ddi=%u exit 0x%llx\n", d, r);
++	return r;
++}
++
++static uint64_t wrapPortProbe(void *port) {
++	uint32_t d = xePortDdi(port);
++	if (d >= 3 && d != 0xFF) XE_HD_LOG("XeNG hd: probePortState ddi=%u enter\n", d);
++	uint64_t r = FunctionCast(wrapPortProbe, oPortProbe)(port);
++	if (d >= 3 && d != 0xFF) XE_HD_LOG("XeNG hd: probePortState ddi=%u exit 0x%llx\n", d, r);
++	return r;
++}
++
++static uint64_t wrapPortEnable(void *port) {
++	uint32_t d = xePortDdi(port);
++	if (d >= 3 && d != 0xFF) XE_HD_LOG("XeNG hd: enablePort ddi=%u enter\n", d);
++	uint64_t r = FunctionCast(wrapPortEnable, oPortEnable)(port);
++	if (d >= 3 && d != 0xFF) XE_HD_LOG("XeNG hd: enablePort ddi=%u exit 0x%llx\n", d, r);
++	return r;
++}
++
++static uint64_t wrapPortDDC(void *port, uint64_t block, uint64_t buf, uint64_t flag) {
++	uint32_t d = xePortDdi(port);
++	if (d >= 3 && d != 0xFF) XE_HD_LOG("XeNG hd: getDDCBlock ddi=%u block=%llu enter\n", d, block);
++	uint64_t r = FunctionCast(wrapPortDDC, oPortDDC)(port, block, buf, flag);
++	if (d >= 3 && d != 0xFF) XE_HD_LOG("XeNG hd: getDDCBlock ddi=%u exit 0x%llx\n", d, r);
++	return r;
++}
++
+ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+ 	if (kextG11FB.loadIndex == index) {
+ 		gIcLFbBlockRuns++;
+@@ -1221,6 +1290,31 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
+ 		auto *activeKext = (kextG11FBTA.loadIndex == index) ? &kextG11FBTA : &kextG11FBT;
+ 		NGreen::callback->setRMMIOIfNecessary();
+ 		SYSLOG("ngreen", "init AppleIntelTGLGraphicsFramebuffer");
++
++		// XE-GMS4-FB: FBMemMgr_Init sizes stolen memory as (GGC << 17) & 0xFE000000 (GMS x 32 MB).
++		// With GMS in 4 MB units (0xF0-0xFE) that is ~4 GB, cursor memory cannot be created and
++		// AppleIntelController::start fails. Same rewrite as Genx does for the ICL framebuffer, but with
++		// the real size: the framebuffer places buffers inside stolen memory, so it must not exceed it.
++		if (NGreen::callback->gmsRaw >= 0xF0 && NGreen::callback->gmsRaw <= 0xFE) {
++			uint32_t realStolen = ((NGreen::callback->gmsRaw & 0x0F) + 1) * 4U * 1024 * 1024;
++			auto fbmm = patcher.solveSymbol(index, "__ZN24AppleIntelBaseController13FBMemMgr_InitEv", address, size);
++			if (!fbmm) patcher.clearError();
++			static const uint8_t find[] = {0xC1, 0xE0, 0x11, 0x25, 0x00, 0x00, 0x00, 0xFE};  // shll $0x11,%eax; andl $0xFE000000,%eax
++			uint8_t repl[] = {0xB8, 0x00, 0x00, 0x00, 0x00, 0x90, 0x90, 0x90};               // movl $realStolen,%eax; nop x3
++			memcpy(repl + 1, &realStolen, sizeof(realStolen));
++			bool patched = false;
++			for (size_t off = 0; fbmm && off < 0x200 && !patched; off++) {
++				auto *p = reinterpret_cast<uint8_t *>(fbmm + off);
++				if (memcmp(p, find, sizeof(find)) != 0) continue;
++				if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) == KERN_SUCCESS) {
++					lilu_os_memcpy(p, repl, sizeof(repl));
++					MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
++					patched = true;
++				}
++			}
++			SYSLOG("ngreen", "XE-GMS4-FB: GMS=0x%02x stolen=0x%x FBMemMgr_Init=%s", NGreen::callback->gmsRaw, realStolen,
++			       patched ? "patched" : "NOT patched");
++		}
+ 		
+ 		bool isprod=false;
+ 		auto prod=patcher.solveSymbol(index, "__ZN24AppleIntelBaseController5startEP9IOService", address, size);
+@@ -1360,12 +1454,26 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
+ 			//{"__ZN21AppleIntelFramebuffer17validateModeDepthEPK29IODetailedTimingInformationV2j", validateModeDepth, this->ovalidateModeDepth},
+ 			//*****
+ 			{"__ZN21AppleIntelFramebuffer19getPixelInformationEiiiP18IOPixelInformation", getPixelInformation, this->ogetPixelInformation},
++			// XE-CURDIAG (log only)
++			{"__ZN21AppleIntelFramebuffer14setCursorImageEPv", wrapSetCursorImage, this->oSetCursorImage},
++			{"__ZN21AppleIntelFramebuffer14setCursorStateEiib", wrapSetCursorState, this->oSetCursorState},
++			{"__ZN24AppleIntelBaseController16hwSetCursorImageEP21AppleIntelFramebufferP20IOHardwareCursorInfo", wrapHwSetCursorImage, this->oHwSetCursorImage},
+ 			//{"__ZN20IntelFBClientControl11doAttributeEjPmmS0_S0_P25IOExternalMethodArguments",wrapFBClientDoAttribute, this->orgFBClientDoAttribute},
+ 			//{"__ZN20IntelFBClientControl24vendor_doDeviceAttributeEjPmmS0_S0_P25IOExternalMethodArguments", releaseDoorbell},
+ 			//{"__ZN21AppleIntelFramebuffer16enableControllerEv", isPanelPowerOn},
+ 		};
+ 		PANIC_COND(!RouteRequestPlus::routeAll(patcher, index, requests, address, size), "ngreen","Failed to route dp symbols");
+ 		gTglFbRoutesDone++;
++		if (xeHdmiDdi()) {
++			RouteRequestPlus hdRequests[] = {
++				{"__ZN14AppleIntelPort11setPortModeENS_8PortModeE", wrapPortSetMode, oPortSetMode},
++				{"__ZN14AppleIntelPort14probePortStateEv", wrapPortProbe, oPortProbe},
++				{"__ZN14AppleIntelPort10enablePortEv", wrapPortEnable, oPortEnable},
++				{"__ZN14AppleIntelPort11getDDCBlockEjPhb", wrapPortDDC, oPortDDC},
++			};
++			SYSLOG_COND(!RouteRequestPlus::routeAll(patcher, index, hdRequests, address, size), "ngreen", "XE-HDMIDIAG: port routes failed");
++			patcher.clearError();
++		}
+ 		if (checkKernelArgument("-ngreenfixbootmode")) {
+ 			SolveRequestPlus crtcSolve[] = {
+ 				{"__ZN24AppleIntelBaseController35hwCRTCToIODetailedTimingInformationEP21AppleIntelFramebufferP29IODetailedTimingInformationV2", gHwCrtcToTimingAddr},
+@@ -1895,6 +2003,13 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
+ 			 {"__ZN16IntelAccelerator17createUserGPUTaskEv", createUserGPUTask, this->ocreateUserGPUTask},
+ 			 {"__ZN11IGAccelTask11withOptionsEP16IntelAccelerator", igAccelTaskWithOptions, this->oigAccelTaskWithOptions},
+ 
++			 // XE-GMS4: when the accelerator is not registered with the framebuffer (accel+0x128c == 0),
++			 // IGMemoryManager::initSegments sizes stolen memory as (GGC & 0xff00) << 17, i.e. GMS x 32 MB.
++			 // Gen12 firmware may encode GMS in 4 MB units (0xF0-0xFE): 0xFE reads as ~8 GB, larger than the
++			 // GTT, so IGRangeAllocator::withRange fails, IGAccelTask::initWithOptions fails, and
++			 // IGAccelTask::withOptions releases a half-built task -> page fault in IOAccelTask::release.
++			 {"__ZN15IGMemoryManager12initSegmentsEv", initSegments, this->oinitSegments},
++
+ 			 // V36: Hook readAndClearInterrupts to initialize Gen11 multi-engine GT interrupts.
+ 			 // Without this, RCS/BCS user interrupts and context-switch notifications may not
+ 			 // be properly enabled, preventing IOAccelF2 from seeing stamp completions.
+@@ -3710,13 +3825,17 @@ void Gen11::hwSetPowerWellStatePGE(AppleIntel::AppleIntelBaseController *that, b
+ void Gen11::hwSetPowerWellStateAux(AppleIntel::AppleIntelBaseController *that, bool param_1, uint param_2)
+ {
+ 	getMember<void *>(that, 0x78) = ccont;
++	if (xeHdmiDdi()) XE_HD_LOG("XeNG hd: Aux en=%u idx=%u enter ctl=%08x\n", (unsigned)param_1, param_2, NGreen::callback->readReg32(0x45444));
+ 	FunctionCast(hwSetPowerWellStateAux, callback->ohwSetPowerWellStateAux)(that,param_1,param_2);
++	if (xeHdmiDdi()) XE_HD_LOG("XeNG hd: Aux exit ctl=%08x\n", NGreen::callback->readReg32(0x45444));
+ }
+ 
+ void Gen11::hwSetPowerWellStateDDI(AppleIntel::AppleIntelBaseController *that, bool param_1, uint param_2)
+ {
+ 	getMember<void *>(that, 0x78) = ccont;
++	if (xeHdmiDdi()) XE_HD_LOG("XeNG hd: DDI en=%u idx=%u enter ctl=%08x\n", (unsigned)param_1, param_2, NGreen::callback->readReg32(0x45454));
+ 	FunctionCast(hwSetPowerWellStateDDI, callback->ohwSetPowerWellStateDDI)(that,param_1,param_2);
++	if (xeHdmiDdi()) XE_HD_LOG("XeNG hd: DDI exit ctl=%08x\n", NGreen::callback->readReg32(0x45454));
+ }
+ 
+ 
+@@ -3886,9 +4005,49 @@ static uint32_t xeBootHold(unsigned long reg, uint32_t val) {
+ 	if (nseen < 8) seen[nseen++] = val;
+ 	return val;
+ }
++// XE-GAMMA: GAMMA_MODE_A (0x4A480) override, for Night Shift experiments. Without the boot-arg nothing changes
++// (bypass, 0). ngreengamma=0xVALUE forces that value instead; ngreengamma=0xffffffff passes Apple's writes through and
++// stops xeFixEnsure from resetting the register, so it can be tested live with xectl.
++// ngreengammamask=0xMASK keeps Apple's value AND MASK. On display 13 (A7A8) Apple writes 0xe0000001: 10-bit post-CSC
++// gamma (bit 30, what Night Shift uses) plus pre-CSC degamma (bit 31), whose TGL-format table display 13 reads wrong
++// (screen glitch). ngreengammamask=0x7fffffff clears only the degamma bit: Night Shift works, no glitch (tested live
++// with 0x40000001/0x60000001). The mask takes precedence over ngreengamma.
++// Both are parsed with PE_parse_boot_argn, which reads the kernel's full boot-args (not Lilu's ~228-character copy),
++// so they can go at the end of the line.
++static uint32_t xeGammaArg() {
++	static int parsed = 0;
++	static uint32_t v = 0;
++	if (!parsed) { parsed = 1; uint32_t t = 0; if (PE_parse_boot_argn("ngreengamma", &t, sizeof(t))) v = t; }
++	return v;
++}
++static bool xeGammaMask(uint32_t *mask) {
++	static int parsed = 0;
++	static bool has = false;
++	static uint32_t m = 0;
++	if (!parsed) { parsed = 1; has = PE_parse_boot_argn("ngreengammamask", &m, sizeof(m)); }
++	if (has) *mask = m;
++	return has;
++}
++static uint32_t xeGammaFilter(uint32_t appleVal) {
++	static uint32_t seen[8]; static int nseen = 0;
++	bool known = false;
++	for (int i = 0; i < nseen; i++) if (seen[i] == appleVal) known = true;
++	if (!known && nseen < 8) { seen[nseen++] = appleVal; IOLog("XeNG gamma: Apple GAMMA_MODE_A=0x%x (ngreengamma=0x%x)\n", appleVal, xeGammaArg()); }
++	uint32_t mask;
++	if (xeGammaMask(&mask)) return appleVal & mask;
++	uint32_t a = xeGammaArg();
++	return a == 0xFFFFFFFFu ? appleVal : a;
++}
+ static uint32_t xeFixFilterWrite(unsigned long reg, uint32_t val) {
+ 	xeBootDiagRecord(reg, val);
+ 	val = xeBootHold(reg, val);
++	if ((reg & 0xFFFFF) == 0xC5100 && xeHdmiDdi() >= 3 && (val & 0x1F) == 7) {
++		static int n = 0;
++		if (n++ < 4) IOLog("XeNG hdmi: GMBUS0 0x%x -> pin %u\n", val, xeHdmiPin());
++		val = (val & ~0x1Fu) | xeHdmiPin();
++	}
++	if (xeHdmiDdi() && xeHdDiagReg((uint32_t)(reg & 0x1FFFFF)))
++		XE_HD_LOG("XeNG hd: W %06lx = %08x\n", reg & 0x1FFFFF, val);
+ 	if (!xeFixEnabled()) return val;
+ 	val = xeNoDpms((uint32_t)(reg & 0x1FFFFF), val);
+ 	// 20/10 (XE-BLR): o brilho ia só até ~50%. Como o BacklightRegistersFix do WhateverGreen: mantém o período do
+@@ -3921,7 +4080,7 @@ static uint32_t xeFixFilterWrite(unsigned long reg, uint32_t val) {
+ 		case 0x42084: return val | 0x40000000u;
+ 		// GAMMA_MODE_A: o driver TGL liga gamma pós-CSC de 10 bits com tabela no formato errado para o
+ 		// display 13 -> texto/cores degradados. Provado ao vivo (17/10 20h): com 0 (bypass) a imagem fica certa.
+-		case 0x4A480: return 0;
++		case 0x4A480: return xeGammaFilter(val);
+ 	}
+ 	return val;
+ }
+@@ -3943,7 +4102,12 @@ static void xeFixEnsure() {
+ 	if (!xeFixEnabled() || !NGreen::callback) return;
+ 	uint32_t ck = NGreen::callback->readReg32(0x42084);
+ 	if (!(ck & 0x40000000u)) NGreen::callback->writeReg32(0x42084, ck | 0x40000000u);
+-	if (NGreen::callback->readReg32(0x4A480) != 0) NGreen::callback->writeReg32(0x4A480, 0);
++	uint32_t gmask;
++	if (xeGammaMask(&gmask)) {
++		uint32_t g = NGreen::callback->readReg32(0x4A480);
++		if (g & ~gmask) NGreen::callback->writeReg32(0x4A480, g & gmask);
++	} else if (xeGammaArg() != 0xFFFFFFFFu && NGreen::callback->readReg32(0x4A480) != xeGammaArg())
++		NGreen::callback->writeReg32(0x4A480, xeGammaArg());
+ 	uint32_t s1 = NGreen::callback->readReg32(0x44FE8);
+ 	if (!(s1 & 0x80000000u)) NGreen::callback->writeReg32(0x44FE8, s1 | 0x80000000u | 0x40c000u);
+ 	static int n = 0; if (n++ < 4) IOLog("XeNG xefix: ensure CK=0x%x S1=0x%x\n", NGreen::callback->readReg32(0x42084), NGreen::callback->readReg32(0x44FE8));
+@@ -4540,6 +4704,16 @@ uint64_t Gen11::getOSInformation(AppleIntel::AppleIntelBaseController *that)
+ 		pinfo[1].connectors[1].type  = ConnectorDP;
+ 		pinfo[1].connectors[1].flags = 0x1 | 0x400;
+ 
++		if (xeHdmiDdi()) {
++			pinfo[1].connectors[1].index = xeHdmiDdi();
++			pinfo[1].connectors[1].busId = xeHdmiBus();
++			pinfo[1].connectors[1].pipe  = 2;
++			pinfo[1].connectors[1].pad   = 0;
++			pinfo[1].connectors[1].type  = ConnectorHDMI;
++			pinfo[1].connectors[1].flags = 0x187;
++			SYSLOG("ngreen", "XE-HDMI: connector 1 = HDMI on DDI %u, bus %u (GMBUS pin %u)", xeHdmiDdi(), xeHdmiBus(), xeHdmiPin());
++		}
++
+ 		// Connectors 2-3: Dummy
+ 		pinfo[1].connectors[2] = { 2, 2, 2, 0, ConnectorDummy, 0 };
+ 		pinfo[1].connectors[3] = { 3, 3, 3, 0, ConnectorDummy, 0 };
+@@ -6686,6 +6860,39 @@ void *Gen11::createUserGPUTask(void *that)
+ 	return nullptr;
+ }
+ 
++// XE-GMS4: see the route comment. initSegments leaves [0xa0,0xa8) = [0, stolen) and
++// [0xb0,0xb8) = [stolen, gttSize - stolen); recompute both with the 4 MB encoding.
++bool Gen11::initSegments(void *that)
++{
++	bool ok = FunctionCast(initSegments, callback->oinitSegments)(that);
++	void *accel = getMember<void *>(that, 0x10);
++	IOPCIDevice *igpu = NGreen::callback ? NGreen::callback->getIGPU() : nullptr;
++	if (!ok || !accel || !igpu || getMember<uint8_t>(accel, 0x128c) != 0)
++		return ok;
++
++	uint16_t ggc = igpu->configRead16(WIOKit::kIOPCIConfigGraphicsControl);
++	uint32_t gms = ggc >> 8;
++	uint64_t base = getMember<uint64_t>(that, 0xa8);
++	uint64_t total = base + getMember<uint64_t>(that, 0xb8);  // wraps back to the GTT size
++	uint64_t stolen = base;
++	if (gms >= 0xF0 && gms <= 0xFE) {
++		// NGreen's decoded size, raised to at least 128 MB. Larger than the framebuffer's real stolen
++		// size (XE-GMS4-FB), which is safe here: this is only where per-task GPU addresses start.
++		stolen = NGreen::callback->stolen_size;
++		if (stolen == 0)
++			stolen = ((gms & 0x0F) + 1) * 4ULL * 1024 * 1024;
++		stolen = (stolen + 0x1FFFFFFULL) & ~0x1FFFFFFULL;  // keep Apple's 32 MB granularity
++	}
++	SYSLOG("ngreen", "XE-GMS4: GGC=0x%04x GMS=0x%02x base=0x%llx gtt=0x%llx -> base=0x%llx",
++	       ggc, gms, base, total, stolen);
++	if (stolen != base && stolen < total) {
++		getMember<uint64_t>(that, 0xa8) = stolen;
++		getMember<uint64_t>(that, 0xb0) = stolen;
++		getMember<uint64_t>(that, 0xb8) = total - stolen;
++	}
++	return ok;
++}
++
+ void *Gen11::igAccelTaskWithOptions(void *that)
+ {
+ 	auto ensureTaskContext = [&](void *task, const char *origin) -> void * {
+@@ -10953,6 +11160,125 @@ void Gen11::FBMemMgr_Init(void *that)
+ 	
+ }
+ 
++// XE-CURDIAG: log-only. CUR_CTL is written from updateCursorParams, which returns 0 unless the framebuffer's
++// cursor-visible flag (fb+0x4270) is set; that flag follows setCursorState(visible). WindowServer hides the
++// hardware cursor when it decides to draw a software cursor, typically after setCursorImage fails.
++IOReturn Gen11::wrapSetCursorImage(void *that, void *image)
++{
++	IOReturn ret = FunctionCast(wrapSetCursorImage, callback->oSetCursorImage)(that, image);
++	static uint32_t n = 0;
++	if (n < 16 || ret != kIOReturnSuccess || (n % 512) == 0)
++		SYSLOG("ngreen", "XE-CURDIAG[%u]: setCursorImage fb=%p img=%p -> 0x%x", n, that, image, ret);
++	n++;
++	return ret;
++}
++
++IOReturn Gen11::wrapSetCursorState(void *that, SInt32 x, SInt32 y, bool visible)
++{
++	IOReturn ret = FunctionCast(wrapSetCursorState, callback->oSetCursorState)(that, x, y, visible);
++	static uint32_t n = 0;
++	static int lastVisible = -1;
++	if (n < 16 || (int)visible != lastVisible || ret != kIOReturnSuccess)
++		SYSLOG("ngreen", "XE-CURDIAG[%u]: setCursorState fb=%p x=%d y=%d visible=%d -> 0x%x flag4270=%u size4278=%u",
++		       n, that, x, y, visible, ret, getMember<uint8_t>(that, 0x4270), getMember<uint32_t>(that, 0x4278));
++	lastVisible = visible;
++	n++;
++	return ret;
++}
++
++// XE-CURSHADOW: on A7A8 the hardware cursor showed 16-pixel dashes. hwSetCursorImage writes the image with the
++// CPU through controller+0xc98, a CPU mapping (the aperture) of the GGTT range starting at controller+0xdc0, into
++// one of the two cursor buffers at fb+0x1f4[0/1] (GGTT 0x3c00000/0x3c40000). That range is backed by the
++// IOBufferMemoryDescriptor at controller+0xcd0. Tests with XeShim (xe-curpat2..5) showed that what is written
++// through the aperture does not reliably reach the pages the display engine reads (whole runs arrive late or not
++// at all), while the same image stored with direct CPU writes displays cleanly. Flushing the CPU cache did not help.
++// So the whole cursor range is backed by our own write-combined buffer: its GGTT PTEs are remapped to it, and
++// controller+0xc98 is pointed at its direct kernel mapping, so hwSetCursorImage stores the image straight into the
++// pages the display reads. Checked on every image update, so a reallocation by hwSetupCursorMemory is picked up.
++// -ngreennocurshadow turns it off.
++static uint64_t xeGgttPhys(uint32_t gfxAddr) {
++	uint64_t pte = NGreen::callback->readGgttPte(gfxAddr >> 12);
++	return (pte & 1) ? (pte & 0x7FFFFFF000ULL) : 0;
++}
++
++static IOBufferMemoryDescriptor *xeShadow;
++static uint8_t *xeShadowVA;
++
++// Called after hwSetCursorImage. Returns true when the shadow was (re)installed by this call.
++bool Gen11::xeCursorShadowInstall(void *controller)
++{
++	static int on = -1;
++	if (on < 0) on = checkKernelArgument("-ngreennocurshadow") ? 0 : 1;
++	if (!on) return false;
++
++	auto *bmd = OSDynamicCast(IOBufferMemoryDescriptor, getMember<OSObject *>(controller, 0xcd0));
++	uint8_t *&appleVA = getMember<uint8_t *>(controller, 0xc98);      // where hwSetCursorImage writes
++	uint32_t g0 = getMember<uint32_t>(controller, 0xdc0);              // GGTT address appleVA maps
++	if (!bmd || !appleVA || !g0) return false;
++	if (xeShadow && appleVA == xeShadowVA) return false;               // installed and still in use
++	size_t len = bmd->getLength();
++	if (len == 0 || len > 0x400000 || (len & 0xFFF)) return false;
++
++	// only take over what is verifiably Apple's cursor range: GGTT page i -> buffer offset i
++	for (uint32_t off = 0; off < len; off += 4096) {
++		if (xeGgttPhys(g0 + off) != bmd->getPhysicalSegment(off, nullptr, kIOMemoryMapperNone)) {
++			static bool logged = false;
++			if (!logged) SYSLOG("ngreen", "XE-CURSHADOW: GGTT 0x%x+0x%x is not Apple's cursor buffer, not installing", g0, off);
++			logged = true;
++			return false;
++		}
++	}
++
++	if (xeShadow && xeShadow->getLength() < len) xeShadow = nullptr;   // Apple grew the range: new shadow (old one kept, never freed)
++	if (!xeShadow) {
++		xeShadow = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++			kIODirectionInOut | kIOMapWriteCombineCache, len, 0x7FFFFFF000ULL);
++		if (!xeShadow || xeShadow->prepare() != kIOReturnSuccess) {
++			OSSafeReleaseNULL(xeShadow);
++			SYSLOG("ngreen", "XE-CURSHADOW: allocation failed");
++			return false;
++		}
++		xeShadowVA = static_cast<uint8_t *>(xeShadow->getBytesNoCopy());
++	}
++
++	// carry the current contents over (read through Apple's mapping, only the two 256 KB cursor buffers known to be
++	// mapped there; the rest stays zero), then switch the PTEs and the CPU pointer
++	bzero(xeShadowVA, len);
++	for (uint32_t off = 0; off < len && off < 0x80000; off += 8)
++		*reinterpret_cast<uint64_t *>(xeShadowVA + off) = *reinterpret_cast<volatile uint64_t *>(appleVA + off);
++	asm volatile("sfence" ::: "memory");
++	for (uint32_t off = 0; off < len; off += 4096) {
++		uint32_t idx = (g0 + off) >> 12;
++		uint64_t pte = NGreen::callback->readGgttPte(idx);
++		uint64_t phys = xeShadow->getPhysicalSegment(off, nullptr, kIOMemoryMapperNone);
++		NGreen::callback->writeGgttPte(idx, (phys & ~0xFFFULL) | (pte & 0xFFF));
++	}
++	(void)NGreen::callback->readGgttPte((g0 + (uint32_t)len - 4096) >> 12);
++	NGreen::callback->writeReg32(0x101008, 1);   // GFX_FLSH_CNTL: flush GGTT TLB
++	SYSLOG("ngreen", "XE-CURSHADOW: installed, GGTT 0x%x len 0x%zx, CPU pointer %p -> %p, shadow phys 0x%llx",
++	       g0, len, appleVA, xeShadowVA, (uint64_t)xeShadow->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone));
++	appleVA = xeShadowVA;
++	return true;
++}
++
++uint64_t Gen11::wrapHwSetCursorImage(void *that, void *fb, void *info)
++{
++	uint64_t ret = FunctionCast(wrapHwSetCursorImage, callback->oHwSetCursorImage)(that, fb, info);
++
++	bool installed = xeCursorShadowInstall(that);
++	// the image of this call went through the aperture before the switch: write it again, now directly
++	if (installed) ret = FunctionCast(wrapHwSetCursorImage, callback->oHwSetCursorImage)(that, fb, info);
++
++	static uint32_t n = 0;
++	if (n < 16 || installed || (n % 512) == 0)
++		SYSLOG("ngreen", "XE-CURDIAG[%u]: hwSetCursorImage fb=%p -> 0x%llx CUR_BASE=0x%x page=0x%llx va=%p ggtt=0x%x%s",
++		       n, fb, ret, NGreen::callback->readReg32(0x70084),
++		       xeGgttPhys(NGreen::callback->readReg32(0x70084) & ~0xFFFu),
++		       getMember<void *>(that, 0xc98), getMember<uint32_t>(that, 0xdc0), installed ? " installed" : "");
++	n++;
++	return ret;
++}
++
+ uint32_t Gen11::probePortMode()
+ {
+ 	auto ret=FunctionCast(probePortMode, callback->oprobePortMode)();
+diff --git a/src/NootedGreen/kern_gen11.hpp b/src/NootedGreen/kern_gen11.hpp
+index 9b288c7..38cfede 100755
+--- a/src/NootedGreen/kern_gen11.hpp
++++ b/src/NootedGreen/kern_gen11.hpp
+@@ -1390,6 +1390,9 @@ private:
+ 
+ 	static void *igAccelTaskWithOptions(void *that);  // V132: cache successful task allocations for null-task fallback
+ 	mach_vm_address_t oigAccelTaskWithOptions {};
++
++	static bool initSegments(void *that);  // XE-GMS4: fix the task VA base when GGC.GMS uses 4 MB units (0xF0-0xFE)
++	mach_vm_address_t oinitSegments {};
+ 	
+ 	static unsigned long submitBlit(void *that, void *param_1, void *param_2, void *param_3, bool param_4);
+ 	mach_vm_address_t osubmitBlit {};
+@@ -1792,6 +1795,15 @@ private:
+ 	
+ 	static void FBMemMgr_Init(void *that);
+ 	mach_vm_address_t oFBMemMgr_Init {};
++
++	// XE-CURDIAG: log-only hooks on the cursor path (why CUR_CTL stays 0 on A7A8)
++	static IOReturn wrapSetCursorImage(void *that, void *image);
++	mach_vm_address_t oSetCursorImage {};
++	static IOReturn wrapSetCursorState(void *that, SInt32 x, SInt32 y, bool visible);
++	mach_vm_address_t oSetCursorState {};
++	static uint64_t wrapHwSetCursorImage(void *that, void *fb, void *info);
++	mach_vm_address_t oHwSetCursorImage {};
++	static bool xeCursorShadowInstall(void *controller);
+ 	
+ 	static int blit3d_supported(void *param_1,void *param_2);
+ 	mach_vm_address_t oblit3d_supported {};
+diff --git a/src/NootedGreen/kern_green.cpp b/src/NootedGreen/kern_green.cpp
+index b1b6831..890ef86 100755
+--- a/src/NootedGreen/kern_green.cpp
++++ b/src/NootedGreen/kern_green.cpp
+@@ -29,6 +29,9 @@ static KernelPatcher::KextInfo kextIOGraphics { "com.apple.iokit.IOGraphicsFamil
+ 	KernelPatcher::KextInfo::Unloaded };
+ static KernelPatcher::KextInfo kextIOAcceleratorFamily2 { "com.apple.iokit.IOAcceleratorFamily2", &pathIOAcceleratorFamily2, 1, {true}, {},
+ 	KernelPatcher::KextInfo::Unloaded };
++static const char *pathIOHDAFamily = "/System/Library/Extensions/AppleHDA.kext/Contents/PlugIns/IOHDAFamily.kext/Contents/MacOS/IOHDAFamily";
++static KernelPatcher::KextInfo kextIOHDAFamily { "com.apple.iokit.IOHDAFamily", &pathIOHDAFamily, 1, {true}, {},
++	KernelPatcher::KextInfo::Unloaded };
+ 
+ NGreen *NGreen::callback = nullptr;
+ 
+@@ -152,6 +155,7 @@ void NGreen::init() {
+ 	lilu.onKextLoadForce(&kextMCCSControl);
+ 	lilu.onKextLoadForce(&kextIOGraphics);*/
+ 	lilu.onKextLoadForce(&kextIOAcceleratorFamily2);
++	if (!checkKernelArgument("-ngreennohpfix")) lilu.onKextLoadForce(&kextIOHDAFamily);
+ 	
+ 	genx.init();
+ 	gen11.init();
+@@ -267,6 +271,7 @@ void NGreen::processPatcher(KernelPatcher &patcher) {
+         }
+ 		
+ 		auto gms = WIOKit::readPCIConfigValue(devInfo->videoBuiltin, WIOKit::kIOPCIConfigGraphicsControl, 0, 16) >> 8;
++		gmsRaw = static_cast<UInt8>(gms);
+ 		
+ 		if (gms < 0x10) {
+ 			stolen_size = gms * 32;
+@@ -501,6 +506,64 @@ static IOReturn wrapSetIdMode(void *that, uint32_t id, uint32_t mode) {
+     return ret;
+ }
+ 
++// XE-HPFIX: the Synaptics/Conexant SN6140 (14F1:1F87) reports its headphone pin, node 0x16, as a vendor-defined
++// widget (wcaps 0x00f00000), although its pin config (0x00211040, HP jack), pin caps (0x1001c: out, HP drive,
++// presence detect), connection list (DACs 0x10/0x11) and pin control (0xc0) are those of a normal headphone pin.
++// AppleHDA builds paths only through pin widgets, so the headphone path of the CX8070 layout was rejected and the
++// whole layout produced no audio device. Report the node as a pin complex: stereo, unsolicited-capable, with a
++// connection list and power control (0x00400581), matching what the node answers to the other verbs.
++IOReturn NGreen::wrapHdaExecuteVerb(void *dev, uint16_t nid, uint16_t verb, uint16_t param, unsigned int *out, bool wait) {
++	IOReturn ret = FunctionCast(wrapHdaExecuteVerb, callback->orgHdaExecuteVerb)(dev, nid, verb, param, out, wait);
++
++	static void *sn6140 = nullptr;
++	if (dev != sn6140) {
++		auto *entry = OSDynamicCast(IORegistryEntry, reinterpret_cast<OSObject *>(dev));
++		auto *vendor = entry ? OSDynamicCast(OSNumber, entry->getProperty("IOHDACodecVendorID")) : nullptr;
++		if (!vendor || vendor->unsigned32BitValue() != 0x14F11F87) return ret;
++		sn6140 = dev;
++	}
++
++	if (ret == kIOReturnSuccess && out && nid == 0x16 && verb == 0xF00 && param == 0x09 && *out == 0x00F00000) {
++		static bool logged = false;
++		if (!logged) SYSLOG("ngreen", "XE-HPFIX: SN6140 node 0x16 widget caps 0x%x -> 0x00400581", *out);
++		logged = true;
++		*out = 0x00400581;
++	}
++
++	// XE-HPLOG: log every setting AppleHDA writes to the codec (12-bit verbs 0x7xx, 4-bit verbs 0x2-0x5) and, when
++	// it touches the headphone/speaker pins, a snapshot of both output paths. -ngreennohplog turns it off.
++	static int hplog = -1;
++	if (hplog < 0) hplog = checkKernelArgument("-ngreennohplog") ? 0 : 1;
++	if (!hplog) return ret;
++	bool isSet = (verb & 0xF00) == 0x700 || (verb >= 0x2 && verb <= 0x5);
++	if (!isSet) return ret;
++	static int nSet = 0;
++	if (nSet++ < 400)
++		SYSLOG("ngreen", "XE-HPLOG: set nid=0x%02x verb=0x%03x param=0x%04x ret=0x%x", nid, verb, param, ret);
++	if ((nid == 0x16 || nid == 0x17) && (verb == 0x707 || verb == 0x70C || verb == 0x705 || verb == 0x701)) {
++		static int nSnap = 0;
++		if (nSnap++ < 40) {
++			auto rd = [&](uint16_t n, uint16_t v, uint16_t pr) {
++				unsigned int r = 0xFFFFFFFF;
++				FunctionCast(wrapHdaExecuteVerb, callback->orgHdaExecuteVerb)(dev, n, v, pr, &r, true);
++				return r;
++			};
++			SYSLOG("ngreen", "XE-HPLOG: snap #%d after nid=0x%02x verb=0x%03x", nSnap, nid, verb);
++			const uint16_t pins[2] = {0x16, 0x17}, dacs[2] = {0x10, 0x11};
++			for (uint16_t n : pins)
++				SYSLOG("ngreen", "XE-HPLOG:  pin 0x%02x pinctl=%02x eapd=%02x pwr=%02x conn=%02x sense=%08x", n,
++				       rd(n, 0xF07, 0), rd(n, 0xF0C, 0), rd(n, 0xF05, 0), rd(n, 0xF01, 0), rd(n, 0xF09, 0));
++			// get amp: 4-bit verb 0xB, payload bit15 output, bit13 left (else right)
++			for (uint16_t n : dacs)
++				SYSLOG("ngreen", "XE-HPLOG:  dac 0x%02x pwr=%02x stream=%02x fmt=%04x ampL=%02x ampR=%02x", n,
++				       rd(n, 0xF05, 0), rd(n, 0xF06, 0), rd(n, 0xA, 0), rd(n, 0xB, 0xA000), rd(n, 0xB, 0x8000));
++			SYSLOG("ngreen", "XE-HPLOG:  afg pwr=%02x gpio=%02x/%02x/%02x", rd(0x01, 0xF05, 0), rd(0x01, 0xF15, 0),
++			       rd(0x01, 0xF16, 0), rd(0x01, 0xF17, 0));
++		}
++	}
++	return ret;
++}
++
+ bool NGreen::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+ 	if (kextIOAcceleratorFamily2.loadIndex == index) {
+ 		SYSLOG("NGreen", "IOAccelF2: TEXT 0x%llx size 0x%lx", address, size);
+@@ -672,6 +735,12 @@ bool NGreen::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
+ 			};
+ 			patcher.routeMultiple(index, requests, address, size);
+ 			patcher.clearError();*/
++} else if (kextIOHDAFamily.loadIndex == index) {
++	// XE-HPFIX: see wrapHdaExecuteVerb. Long route: AppleALC routes the same function when alcverbs=1 is set,
++	// and Lilu only chains routes when none of them is a short jump.
++	KernelPatcher::RouteRequest request {"__ZN16IOHDACodecDevice11executeVerbEtttPjb", wrapHdaExecuteVerb, orgHdaExecuteVerb};
++	SYSLOG_COND(!patcher.routeMultipleLong(index, &request, 1, address, size), "ngreen", "XE-HPFIX: failed to route executeVerb");
++	patcher.clearError();
+ } else if (genx.processKext(patcher, index, address, size)) {
+ 	DBGLOG("ngreen", "Processed Generation x configuration");
+ } else if (gen11.processKext(patcher, index, address, size)) {
+diff --git a/src/NootedGreen/kern_green.hpp b/src/NootedGreen/kern_green.hpp
+index c279582..84158fb 100755
+--- a/src/NootedGreen/kern_green.hpp
++++ b/src/NootedGreen/kern_green.hpp
+@@ -72,7 +72,11 @@ class NGreen {
+ 	mach_vm_address_t orgApplePanelSetDisplay {0};
+ 	static bool wrapApplePanelSetDisplay(IOService *that, IODisplay *display);
+ 	
++	mach_vm_address_t orgHdaExecuteVerb {0};
++	static IOReturn wrapHdaExecuteVerb(void *dev, uint16_t nid, uint16_t verb, uint16_t param, unsigned int *out, bool wait);
++	
+ 	UInt32 stolen_size;
++	UInt8 gmsRaw {0};  // XE-GMS4: GGC bits 15:8 as read at boot (0xF0-0xFE = 4 MB units)
+ 	uint32_t framebufferId {0};
+ 	
+ 	// Public MMIO register access (used by display link training, display merge, etc.)
+@@ -86,6 +90,19 @@ class NGreen {
+ 		}
+ 	}
+ 
++	// GGTT PTE idx (PTEs live at BAR0 + 8 MB); 0 when outside the mapped BAR
++	uint64_t readGgttPte(uint32_t idx) {
++		uint64_t off = 0x800000ULL + idx * 8ULL;
++		if (!rmmio || !rmmioPtr || off + 8 > this->rmmio->getLength()) return 0;
++		return this->rmmioPtr[off >> 2] | (uint64_t)this->rmmioPtr[(off >> 2) + 1] << 32;
++	}
++
++	void writeGgttPte(uint32_t idx, uint64_t pte) {
++		uint64_t off = 0x800000ULL + idx * 8ULL;
++		if (!rmmio || !rmmioPtr || off + 8 > this->rmmio->getLength()) return;
++		*reinterpret_cast<volatile uint64_t *>(reinterpret_cast<volatile uint8_t *>(this->rmmioPtr) + off) = pte;
++	}
++
+ 	// reg = byte offset (i915 convention). rmmioPtr is uint32_t* so divide by 4.
+ 	void writeReg32(unsigned long reg, UInt32 val) {
+ 		if (!rmmio || !rmmioPtr) return;
+@@ -283,6 +300,7 @@ class NGreen {
+     bool isRealTGL = false;  // true if CPU is genuine TGL (model 0x8C/0x8D), false if spoofed (RPL/ADL)
+ public:
+     bool getIsRealTGL() const { return isRealTGL; }
++    IOPCIDevice *getIGPU() const { return iGPU; }  // XE-GMS4: GGC read from Gen11::initSegments
+     uint64_t mmioLength() const { return (rmmio && rmmioPtr) ? rmmio->getLength() : 0; }  // xe/rc6fw (22/10)
+ private:
+     bool dmcIsAdlp = false;    // true when ADL-P DMC blob was loaded in hwInitializeCState
